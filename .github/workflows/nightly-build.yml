@@ -1,0 +1,227 @@
+name: ShipThis - Nightly Build
+on:
+  schedule:
+    # Run daily at 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:  # Allow manual triggering
+
+permissions:
+  contents: write
+
+jobs:
+  sync-and-build:
+    runs-on: ubuntu-latest
+    name: Sync with upstream and build templates
+    env:
+      SCONSFLAGS: lto=full
+      GH_REPO: ${{ github.repository }}
+    outputs:
+      upstream_commit_hash: ${{ steps.commit-info.outputs.upstream_commit_hash }}
+      full_upstream_commit_hash: ${{ steps.commit-info.outputs.full_upstream_commit_hash }}
+      local_commit_hash: ${{ steps.commit-info.outputs.local_commit_hash }}
+      full_local_commit_hash: ${{ steps.commit-info.outputs.full_local_commit_hash }}
+      build_date: ${{ steps.commit-info.outputs.build_date }}
+      tag_name: ${{ steps.commit-info.outputs.tag_name }}
+      release_exists: ${{ steps.commit-info.outputs.release_exists }}
+    
+    steps:
+      - name: Checkout repository 3.x
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+          ref: 3.x
+          
+      - name: Configure Git
+        run: |
+          git config --global user.name "Daily Build Bot"
+          git config --global user.email "actions@github.com"
+          
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/godotengine/godot.git || true
+          git remote -v
+          
+      - name: Fetch upstream changes
+        run: |
+          git fetch upstream
+          git fetch upstream 3.x:upstream-3.x
+          
+      - name: Check if upstream is ahead (new commits to build)
+        id: check-commits
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "HEAD:           $(git rev-parse HEAD)"
+          echo "upstream/3.x:   $(git rev-parse upstream/3.x)"
+          read ahead behind < <(git rev-list --left-right --count HEAD...upstream/3.x | awk '{print $1, $2}')
+          echo "ahead_of_upstream=${ahead}"
+          echo "behind_upstream=${behind}"
+          VALUE=$([ "$behind" -gt 0 ] && echo true || echo false)
+          echo "has_new_commits=$VALUE" >> "$GITHUB_OUTPUT"
+          echo "Final: has_new_commits=$VALUE"
+          
+      - name: Get commit info for tagging (debug)
+        id: commit-info
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -x
+
+          gh --version || true
+          gh auth status || true
+
+          BUILD_DATE="$(date +%Y-%m-%d)"
+          UPSTREAM_COMMIT_HASH="$(git rev-parse --short=7 upstream/3.x)"
+          FULL_UPSTREAM_COMMIT_HASH="$(git rev-parse upstream/3.x)"
+          LOCAL_COMMIT_HASH="$(git rev-parse --short=7 HEAD)"
+          FULL_LOCAL_COMMIT_HASH="$(git rev-parse HEAD)"
+          TAG_NAME="godot-3.x-${UPSTREAM_COMMIT_HASH}"
+
+          echo "REPO=${REPO}"
+          echo "TAG_NAME=${TAG_NAME}"
+
+          # Force repo on all gh calls (and we also set GH_REPO in env)
+          echo "## Debug: list last 10 releases (repo-scoped)"
+          gh release list --repo "$REPO" --limit 10 || true
+
+          echo "## Debug: grep for our TAG in release list (repo-scoped)"
+          if gh release list --repo "$REPO" --limit 200 | grep -F " ${TAG_NAME} " >/dev/null 2>&1; then
+            echo "Found TAG in release list"
+          else
+            echo "TAG not present in release list (within 200 latest)"
+          fi
+
+          echo "## Debug: check release via gh release view (repo-scoped)"
+          RELEASE_EXISTS=false
+          if gh release view "${TAG_NAME}" --repo "$REPO" >/dev/null 2>&1; then
+            echo "gh release view succeeded for ${TAG_NAME}"
+            RELEASE_EXISTS=true
+          else
+            echo "gh release view did not find ${TAG_NAME}"
+          fi
+
+          {
+            echo "upstream_commit_hash=${UPSTREAM_COMMIT_HASH}"
+            echo "build_date=${BUILD_DATE}"
+            echo "tag_name=${TAG_NAME}"
+            echo "full_upstream_commit_hash=${FULL_UPSTREAM_COMMIT_HASH}"
+            echo "release_exists=${RELEASE_EXISTS}"
+            echo "local_commit_hash=${LOCAL_COMMIT_HASH}"
+            echo "full_local_commit_hash=${FULL_LOCAL_COMMIT_HASH}"
+          } >> "$GITHUB_OUTPUT"
+
+          set +x
+          echo "::group::Tag/Release Debug (summary)"
+          echo "TAG_NAME=${TAG_NAME}"
+          echo "RELEASE_EXISTS=${RELEASE_EXISTS}"
+          echo "::endgroup::"
+
+      # moved after commit-info so it can use release_exists
+      - name: Rebase onto upstream/3.x and push
+        if: ${{ steps.check-commits.outputs.has_new_commits == 'true' }}
+        run: |
+          set -euo pipefail
+          git fetch upstream 3.x
+          git rebase upstream/3.x
+          git push --force-with-lease origin 3.x
+
+      - name: Setup dependencies
+        if: ${{ steps.commit-info.outputs.release_exists == 'false' }}
+        uses: ./.github/actions/godot-deps
+        
+      - name: Linux dependencies
+        if: ${{ steps.commit-info.outputs.release_exists == 'false' }}
+        shell: bash
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/{azure,microsoft}*
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends build-essential pkg-config libx11-dev \
+              libxcursor-dev libxinerama-dev libgl1-mesa-dev libglu-dev libasound2-dev \
+              libpulse-dev libdbus-1-dev libudev-dev libxi-dev libxrandr-dev yasm xvfb wget unzip \
+              libspeechd-dev speech-dispatcher
+        
+      - name: Setup Python and SCons
+        if: ${{ steps.commit-info.outputs.release_exists == 'false' }}
+        uses: ./.github/actions/godot-deps
+        
+      - name: Build Headless For Linux
+        id: linux-build
+        if: ${{ steps.commit-info.outputs.release_exists == 'false' }}
+        uses: ./.github/actions/godot-build
+        with:
+          sconsflags: ${{ env.SCONSFLAGS }}
+          platform: server
+          target: release_debug
+          tools: true
+          
+      - name: Build Android ARMv7
+        id: android-build
+        if: ${{ steps.commit-info.outputs.release_exists == 'false' }}
+        uses: ./.github/actions/godot-build
+        with:
+          sconsflags: ${{ env.SCONSFLAGS }} android_arch=armv7
+          platform: android
+          target: release
+          tools: false
+          
+      - name: Build Android ARM64
+        id: android-build-arm64
+        if: ${{ steps.commit-info.outputs.release_exists == 'false' }}
+        uses: ./.github/actions/godot-build
+        with:
+          sconsflags: ${{ env.SCONSFLAGS }} android_arch=arm64v8
+          platform: android
+          target: release
+          tools: false
+          
+      - name: Generate Godot templates
+        if: ${{ steps.commit-info.outputs.release_exists == 'false' }}
+        run: |
+          cd platform/android/java
+          ./gradlew generateGodotTemplates
+          cd ../../..
+          ls -l bin/
+          
+      - name: List build artifacts
+        if: ${{ steps.commit-info.outputs.release_exists == 'false' }}
+        run: |
+          echo "Build artifacts:"
+          ls -la bin/
+          
+      - name: Create/Update release + upload assets
+        uses: softprops/action-gh-release@v2
+        if: ${{ steps.commit-info.outputs.release_exists == 'false' }}
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: ${{ steps.commit-info.outputs.tag_name }}
+          target_commitish: ${{ steps.commit-info.outputs.full_local_commit_hash }}
+          name: ShipThis Build ${{ steps.commit-info.outputs.build_date }} (${{ steps.commit-info.outputs.upstream_commit_hash }})
+          body: |
+            ## ShipThis Godot 3.x Build
+
+            **Build Date:** ${{ steps.commit-info.outputs.build_date }}
+            **Commit:** ${{ steps.commit-info.outputs.upstream_commit_hash }}
+            **Full SHA:** ${{ steps.commit-info.outputs.full_upstream_commit_hash }}
+          files: bin/*
+          overwrite_files: true
+          fail_on_unmatched_files: false
+
+      - name: Create summary
+        if: ${{ always() }}
+        run: |
+          echo "### Summary"
+          echo "has_new_commits=${{ steps.check-commits.outputs.has_new_commits }}"
+          echo "release_exists=${{ steps.commit-info.outputs.release_exists }}"
+          echo "tag_name=${{ steps.commit-info.outputs.tag_name }}"
+          if [ "${{ steps.commit-info.outputs.release_exists }}" == "true" ]; then
+            echo "⏭️ Skipped release creation - already exists for commit ${{ steps.commit-info.outputs.upstream_commit_hash }}"
+          elif [ "${{ steps.check-commits.outputs.has_new_commits }}" == "true" ]; then
+            echo "✅ Successfully synced with upstream and built templates"
+          else
+            echo "ℹ️ No new upstream changes found"
+          fi
